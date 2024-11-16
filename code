@@ -1,0 +1,188 @@
+install.packages("tidyverse")
+install.packages("rsample")
+install.packages("caret")
+install.packages("rvest")
+install.packages("stringr")
+install.packages("hablar")
+
+library(tidyverse)
+library(rsample)
+library(caret)
+library(stringr)
+library(hablar)
+
+file_list <- c("./jordanpoolestats/19-20.csv", 
+               "./jordanpoolestats/20-21.csv",
+               "./jordanpoolestats/21-22.csv",
+               "./jordanpoolestats/22-23.csv",
+               "./jordanpoolestats/23-24.csv")
+
+JordanPoole_list <- lapply(file_list, read.csv)
+
+for (i in 1:length(JordanPoole_list)) {
+  season_range <- gsub(".*(\\d{2}-\\d{2})\\.csv", "\\1", basename(file_list[i]))
+  start_year <- as.numeric(substr(season_range, 1, 2)) + 2000
+  end_year <- as.numeric(substr(season_range, 4, 5)) + 2000
+  JordanPoole_list[[i]]$Season <- paste(start_year, end_year, sep = "-")
+}
+
+JordanPoole <- do.call(rbind, JordanPoole_list)
+
+JordanPoole <- JordanPoole %>% select(-which(colSums(is.na(JordanPoole)) == nrow(JordanPoole)))
+
+JordanPoole <- JordanPoole[!(JordanPoole$GS == "Did Not Play" |
+                               JordanPoole$GS == "Did Not Dress" |
+                               JordanPoole$GS == "GS" |
+                               JordanPoole$GS == "Inactive" |
+                               JordanPoole$GS == "Not With Tm"),]
+
+colnames(JordanPoole)[6] <- "Location"
+colnames(JordanPoole)[8] <- "WinLoss"
+
+JordanPoole$Location <- ifelse(JordanPoole$Location == "@", "Away", "Home")
+
+Index <- str_split_fixed(JordanPoole$WinLoss, " ", 2)
+JordanPoole <- cbind(JordanPoole, Index)
+JordanPoole <- JordanPoole %>% select(-WinLoss)
+names(JordanPoole)[names(JordanPoole) == "1"] <- "WinLoss"
+JordanPoole <- JordanPoole %>% select(-"2")
+
+names(JordanPoole)[names(JordanPoole) == "Rk"] <- "TmGameSeason"
+names(JordanPoole)[names(JordanPoole) == "G"] <- "PlayerGameSeason"
+
+JordanPoole <- JordanPoole %>%
+  convert(
+    int("TmGameSeason", "PlayerGameSeason", "FG", "FGA", "X3P", "X3PA", "FT", "FTA", "ORB", "DRB", "TRB", "AST", "STL", "BLK", "TOV", "PF", "PTS", "GmSc", "X..."),
+    num("FG.", "X3P.", "FT.", "FG.", "FT.", "X3P.", "GmSc"),
+    dte("Date"),
+    fct("Tm", "Location", "Opp", "WinLoss", "GS")
+  )
+
+JordanPoole$DoubleDouble <- with(JordanPoole, 
+                                 (PTS >= 10 & AST >= 10) | 
+                                   (PTS >= 10 & TRB >= 10) | 
+                                   (PTS >= 10 & BLK >= 10) | 
+                                   (PTS >= 10 & STL >= 10) | 
+                                   (AST >= 10 & TRB >= 10) | 
+                                   (AST >= 10 & BLK >= 10) | 
+                                   (AST >= 10 & STL >= 10) | 
+                                   (TRB >= 10 & BLK >= 10) | 
+                                   (TRB >= 10 & STL >= 10) | 
+                                   (BLK >= 10 & STL >= 10)
+)
+
+JordanPoole$DoubleDouble <- as.logical(JordanPoole$DoubleDouble)
+
+set.seed(123)
+JordanPooleSplit <- initial_split(JordanPoole, prop = 0.7, strata = "DoubleDouble")
+JordanPooleTrain <- training(JordanPooleSplit)
+JordanPooleTest <- testing(JordanPooleSplit)
+
+JordanPoole <- JordanPoole %>%
+  select(-FG, -FGA, -FT, -FTA, -ORB, -DRB, -TRB, -AST, -STL, -BLK, -PTS, -GmSc) %>%
+  select(-'FG.', -'X3P', -'X3PA', -'X3P.', -'FT.') %>%
+  select(-TOV, -PF, -WinLoss) %>%
+  select(-Age, -MP,)
+
+JordanPoole <- JordanPoole %>%
+  arrange(Date) %>%
+  mutate(DaysSinceLastGame = Date - lag(Date))
+
+JordanPoole$BackToBack <- ifelse(JordanPoole$DaysSinceLastGame == 1, TRUE, FALSE)
+JordanPoole <- JordanPoole %>%
+  select(-Date, -DaysSinceLastGame)
+
+JordanPoole$Conference <- ifelse(JordanPoole$Opp == "ATL", "Eastern",
+                                 ifelse(JordanPoole$Opp == "BOS", "Eastern", NA))
+
+JordanPoole$TimeZone <- ifelse(JordanPoole$Location == "Home", "Eastern",
+                               ifelse(JordanPoole$Location == "Away" & JordanPoole$Opp == "ATL", "Eastern", 
+                                      ifelse(JordanPoole$Location == "Away" & JordanPoole$Opp == "BOS", "Eastern", NA)))
+
+JordanPooleTrain <- JordanPooleTrain %>%
+  arrange(Date)
+
+JordanPooleTrain <- JordanPooleTrain %>%
+  mutate(DaysSinceLastGame = as.numeric(Date - lag(Date)))
+
+JordanPooleTrain <- JordanPooleTrain %>%
+  mutate(BackToBack = ifelse(DaysSinceLastGame == 1, TRUE, FALSE))
+
+JordanPooleTrain <- JordanPooleTrain %>%
+  filter(!is.na(DaysSinceLastGame))
+
+JordanPoole$DoubleDouble <- as.factor(JordanPoole$DoubleDouble)
+
+set.seed(123)
+cv_model3 <- train(
+  DoubleDouble ~ TmGameSeason + PlayerGameSeason + GS + X... + BackToBack, 
+  data = JordanPoole, 
+  method = "glm",
+  family = "binomial",
+  trControl = trainControl(method = "cv", number = 10), 
+  na.action = na.exclude
+)
+
+JordanPoole$DoubleDouble <- factor(JordanPoole$DoubleDouble, levels = c("FALSE", "TRUE"))
+
+sum(is.na(JordanPoole$DoubleDouble))  
+sum(is.na(JordanPooleTrain))  
+
+JordanPooleTrain <- na.omit(JordanPooleTrain)
+
+colnames(JordanPooleTrain)
+
+JordanPoole$DoubleDouble <- factor(JordanPoole$DoubleDouble, levels = c(FALSE, TRUE))
+
+set.seed(123)
+train_index <- createDataPartition(JordanPoole$DoubleDouble, p = 0.8, list = FALSE)
+JordanPooleTrain <- JordanPoole[train_index, ]
+JordanPooleTest <- JordanPoole[-train_index, ]
+
+library(caret)
+
+LogisticRegMultiple1 <- train(
+  DoubleDouble ~ TmGameSeason + PlayerGameSeason + GS + BackToBack, 
+  data = JordanPooleTrain,
+  method = "glm",
+  family = binomial(link = "logit"),
+  trControl = trainControl(method = "cv", number = 10),
+  na.action = na.pass
+)
+
+LogisticRegMultiple2 <- train(
+  DoubleDouble ~ TmGameSeason + PlayerGameSeason + GS + BackToBack, 
+  data = JordanPooleTrain,
+  method = "glm",
+  family = "binomial",
+  trControl = trainControl(method = "cv", number = 10),
+  na.action = na.pass
+)
+
+cv_model3 <- train(
+  DoubleDouble ~ TmGameSeason + PlayerGameSeason + GS + BackToBack, 
+  data = JordanPooleTrain, 
+  method = "glm",
+  family = "binomial", 
+  trControl = trainControl(method = "cv", number = 10), 
+  na.action = na.exclude
+)
+
+res <- resamples(list(
+  model1 = LogisticRegMultiple1, 
+  model2 = LogisticRegMultiple2, 
+  model3 = cv_model3
+))
+
+summary(res)$statistics$Accuracy
+
+pred_class <- predict(cv_model3, JordanPooleTest)
+
+JordanPooleTest$DoubleDouble <- factor(
+  JordanPooleTest$DoubleDouble, levels = levels(JordanPooleTrain$DoubleDouble)
+)
+
+confusionMatrix(
+  data = relevel(pred_class, ref = "TRUE"), 
+  reference = relevel(JordanPooleTest$DoubleDouble, ref = "TRUE")
+)
