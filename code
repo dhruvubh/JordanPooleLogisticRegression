@@ -1,4 +1,4 @@
-```R
+
 # install necessary packages
 install.packages("tidyverse") # for data manipulation and visualization
 install.packages("rsample")   # for data splitting
